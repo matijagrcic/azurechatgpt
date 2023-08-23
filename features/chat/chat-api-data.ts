@@ -8,7 +8,6 @@ import {
   HumanMessagePromptTemplate,
   SystemMessagePromptTemplate,
 } from "langchain/prompts";
-import { ChainValues } from "langchain/schema";
 import {
   AzureCogDocument,
   AzureCogSearch,
@@ -32,7 +31,7 @@ export const PromptDataGPT = async (props: PromptGPTProps) => {
     streaming: true,
   });
 
-  const relevantDocuments = findRelevantDocuments(lastHumanMessage.content);
+  const relevantDocuments = await findRelevantDocuments(lastHumanMessage.content);
 
   const chain = loadQAMapReduceChain(chatModel, {
     combinePrompt: defineSystemPrompt(),
@@ -41,6 +40,7 @@ export const PromptDataGPT = async (props: PromptGPTProps) => {
 
   const memory = buildMemory(chats);
 
+  await handlers.handleChainStart(null, null, id);
   chain.call(
     {
       input_documents: relevantDocuments,
@@ -50,22 +50,23 @@ export const PromptDataGPT = async (props: PromptGPTProps) => {
     [
       {
         ...handlers,
-        handleChainEnd: async (
-          outputs: ChainValues,
-          runId: string,
-          parentRunId?: string,
-          tags?: string[]
-        ) => {
-          await handlers.handleChainEnd(outputs, runId);
-          await inertPromptAndResponse(
-            id,
-            lastHumanMessage.content,
-            outputs.text
-          );
+        handleLLMNewToken: async (_token: string) => {
+          // this is to prevent generating content in the map phase
         },
       },
     ]
-  );
+  ).then(({ text: answerContent }) => {
+    const run = async () => {
+      await handlers.handleLLMNewToken(answerContent)
+      await handlers.handleChainEnd(null, id)
+      await inertPromptAndResponse(
+        id,
+        lastHumanMessage.content,
+        answerContent
+      );
+    };
+    run();
+  });
 
   return new StreamingTextResponse(stream);
 };
@@ -81,7 +82,7 @@ const findRelevantDocuments = async (query: string) => {
 };
 
 const defineSystemPrompt = () => {
-  const system_combine_template = `Given the following extracted parts of a long document and a question, create a final answer. 
+  const system_combine_template = `Given the following extracted parts of a long document and a question, create a final answer.
   If you don't know the answer, politely decline to answer the question. Don't try to make up an answer.
   ----------------
   {summaries}`;
@@ -113,7 +114,10 @@ const buildMemory = (chats: ChatMessageModel[]) => {
 };
 
 const initVectorStore = () => {
-  const embedding = new OpenAIEmbeddings();
+  const embedding = new OpenAIEmbeddings({
+    openAIApiKey: process.env.AZURE_OPENAI_API_KEY,
+    azureOpenAIApiDeploymentName: 'embedding'
+  });
   const azureSearch = new AzureCogSearch<FaqDocumentIndex>(embedding, {
     name: process.env.AZURE_SEARCH_NAME,
     indexName: process.env.AZURE_SEARCH_INDEX_NAME,
